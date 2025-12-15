@@ -4,6 +4,7 @@ namespace App\Controller;
 
 use App\Entity\User;
 use App\Service\JwtService;
+use App\Service\ActivityLogService;
 use Doctrine\ORM\EntityManagerInterface;
 use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
 use Symfony\Component\HttpFoundation\JsonResponse;
@@ -18,7 +19,8 @@ class AuthController extends AbstractController
         Request $request,
         EntityManagerInterface $em,
         UserPasswordHasherInterface $passwordHasher,
-        JwtService $jwtService
+        JwtService $jwtService,
+        ActivityLogService $activityLogService
     ): JsonResponse {
         $data = json_decode($request->getContent(), true);
         $email = $data['email'] ?? '';
@@ -30,37 +32,8 @@ class AuthController extends AbstractController
             return new JsonResponse(['error' => 'Invalid credentials'], 401);
         }
 
-        // Check if account is disabled or archived
-        if ($user->getStatus() !== 'active') {
-            $statusMessage = $user->getStatus() === 'disabled' 
-                ? 'Your account has been disabled. Please contact an administrator.'
-                : 'Your account has been archived. Please contact an administrator.';
-            return new JsonResponse(['error' => $statusMessage], 403);
-        }
-
-        // Log the login activity for admin and staff only
-        $roles = $user->getRoles();
-        if (in_array('ROLE_ADMIN', $roles) || in_array('ROLE_STAFF', $roles)) {
-            try {
-                $targetData = [
-                    'entity' => 'User',
-                    'entity_id' => $user->getId(),
-                    'entity_name' => $user->getUsername(),
-                ];
-
-                $activityLog = new \App\Entity\ActivityLog();
-                $activityLog->setUserId($user->getId());
-                $activityLog->setUsername($user->getUsername());
-                $activityLog->setRole(implode(',', $user->getRoles()));
-                $activityLog->setAction('LOGIN');
-                $activityLog->setTargetData(json_encode($targetData));
-
-                $em->persist($activityLog);
-                $em->flush();
-            } catch (\Exception $e) {
-                // Log error but don't fail login
-            }
-        }
+        // Log the login activity
+        $activityLogService->logLogin($user, $request);
 
         $token = $jwtService->generateToken([
             'id' => $user->getId(),
@@ -70,15 +43,7 @@ class AuthController extends AbstractController
 
         return new JsonResponse([
             'token' => $token,
-            'roles' => $user->getRoles(),
-            'user' => [
-                'id' => $user->getId(),
-                'username' => $user->getUsername(),
-                'email' => $user->getEmail(),
-                'firstName' => $user->getFirstName(),
-                'lastName' => $user->getLastName(),
-                'role' => $user->getRoles()[0] ?? 'ROLE_USER'
-            ]
+            'roles' => $user->getRoles()
         ]);
     }
 
@@ -86,7 +51,8 @@ class AuthController extends AbstractController
     public function logout(
         Request $request,
         JwtService $jwtService,
-        EntityManagerInterface $em
+        EntityManagerInterface $em,
+        ActivityLogService $activityLogService
     ): JsonResponse {
         $authHeader = $request->headers->get('Authorization');
         
@@ -104,29 +70,15 @@ class AuthController extends AbstractController
                 $user = $em->getRepository(User::class)->find($userId);
                 
                 if ($user) {
-                    // Only log logout activity for admin and staff roles
-                    $roles = $user->getRoles();
-                    if (in_array('ROLE_ADMIN', $roles) || in_array('ROLE_STAFF', $roles)) {
-                        try {
-                            $targetData = [
-                                'entity' => 'User',
-                                'entity_id' => $user->getId(),
-                                'entity_name' => $user->getUsername(),
-                            ];
-
-                            $activityLog = new \App\Entity\ActivityLog();
-                            $activityLog->setUserId($user->getId());
-                            $activityLog->setUsername($user->getUsername());
-                            $activityLog->setRole(implode(',', $user->getRoles()));
-                            $activityLog->setAction('LOGOUT');
-                            $activityLog->setTargetData(json_encode($targetData));
-
-                            $em->persist($activityLog);
-                            $em->flush();
-                        } catch (\Exception $e) {
-                            // Log error but don't fail logout
-                        }
+                    // Only log logout activity for admin and staff roles (not regular users)
+                    $userRoles = $user->getRoles();
+                    $isAdminOrStaff = in_array('ROLE_ADMIN', $userRoles) || in_array('ROLE_STAFF', $userRoles);
+                    
+                    if ($isAdminOrStaff) {
+                        // Log the logout activity in activity logs for admin and staff
+                        $activityLogService->logLogout($user, $request);
                     }
+                    // Note: Regular users (ROLE_USER only) can logout but it won't be logged
                 }
             }
 

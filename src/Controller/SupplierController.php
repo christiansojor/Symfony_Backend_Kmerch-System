@@ -2,30 +2,30 @@
 
 namespace App\Controller;
 
-use App\Entity\ActivityLog;
 use App\Entity\Supplier;
 use App\Entity\User;
 use App\Repository\SupplierRepository;
+use App\Service\ActivityLogService;
 use App\Service\JwtService;
 use Doctrine\ORM\EntityManagerInterface;
 use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
-use Symfony\Bundle\SecurityBundle\Security;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\Routing\Annotation\Route;
 use Symfony\Component\Validator\Validator\ValidatorInterface;
-use Psr\Log\LoggerInterface;
 
 #[Route('/api/suppliers')]
 final class SupplierController extends AbstractController
 {
     public function __construct(
-        private JwtService $jwtService,
-        private Security $security,
-        private LoggerInterface $logger
+        private ActivityLogService $activityLogService,
+        private JwtService $jwtService
     ) {}
 
-    private function getUserFromToken(Request $request, EntityManagerInterface $em): ?User
+    /**
+     * Get current user from JWT token (admin/staff only for logging)
+     */
+    private function getCurrentUser(Request $request, EntityManagerInterface $em): ?User
     {
         $authHeader = $request->headers->get('Authorization');
         
@@ -37,19 +37,34 @@ final class SupplierController extends AbstractController
 
         try {
             $decoded = $this->jwtService->validateToken($token);
+            
+            if ($decoded === null || !is_array($decoded)) {
+                return null;
+            }
+            
             $userId = $decoded['id'] ?? null;
 
             if (!$userId) {
                 return null;
             }
 
-            return $em->getRepository(User::class)->find($userId);
+            $user = $em->getRepository(User::class)->find($userId);
+
+            if (!$user) {
+                return null;
+            }
+
+            // Only log for admin/staff
+            $roles = $user->getRoles();
+            if (!in_array('ROLE_ADMIN', $roles) && !in_array('ROLE_STAFF', $roles)) {
+                return null;
+            }
+
+            return $user;
         } catch (\Exception $e) {
-            $this->logger->error('Failed to get user from token', ['error' => $e->getMessage()]);
             return null;
         }
     }
-
     #[Route('', name: 'api_supplier_index', methods: ['GET'])]
     public function index(SupplierRepository $supplierRepository): JsonResponse
     {
@@ -94,6 +109,7 @@ final class SupplierController extends AbstractController
                 ->setAddress($data['address'] ?? null)
                 ->setStatus($data['status'] ?? 'active');
 
+            // ✅ Validate entity fields before saving
             $errors = $validator->validate($supplier);
             if (count($errors) > 0) {
                 $errorMessages = [];
@@ -106,8 +122,17 @@ final class SupplierController extends AbstractController
             $em->persist($supplier);
             $em->flush();
 
-            // Direct logging as backup - must happen after flush to get supplier ID
-            $this->logActivity('CREATE', $supplier, $request, $em, true);
+            // Log activity for admin/staff
+            $currentUser = $this->getCurrentUser($request, $em);
+            if ($currentUser) {
+                $this->activityLogService->logCreate(
+                    $currentUser,
+                    'Supplier',
+                    $supplier->getId(),
+                    $supplier->getCompanyName(),
+                    $request
+                );
+            }
 
             return $this->json([
                 'message' => 'Supplier created successfully',
@@ -166,6 +191,7 @@ final class SupplierController extends AbstractController
                 ->setAddress($data['address'] ?? $supplier->getAddress())
                 ->setStatus($data['status'] ?? $supplier->getStatus());
 
+            // ✅ Validate updates too
             $errors = $validator->validate($supplier);
             if (count($errors) > 0) {
                 $errorMessages = [];
@@ -177,8 +203,17 @@ final class SupplierController extends AbstractController
 
             $em->flush();
 
-            // Direct logging as backup
-            $this->logActivity('UPDATE', $supplier, $request, $em, true);
+            // Log activity for admin/staff
+            $currentUser = $this->getCurrentUser($request, $em);
+            if ($currentUser) {
+                $this->activityLogService->logUpdate(
+                    $currentUser,
+                    'Supplier',
+                    $supplier->getId(),
+                    $supplier->getCompanyName(),
+                    $request
+                );
+            }
 
             return $this->json(['message' => 'Supplier updated successfully']);
         } catch (\Exception $e) {
@@ -195,98 +230,28 @@ final class SupplierController extends AbstractController
                 return $this->json(['error' => 'Supplier not found'], 404);
             }
 
-            // Capture data before deletion
-            $supplierData = [
-                'id' => $supplier->getId(),
-                'companyName' => $supplier->getCompanyName(),
-                'email' => $supplier->getEmail(),
-                'status' => $supplier->getStatus()
-            ];
+            // Store info before deletion for logging
+            $supplierId = $supplier->getId();
+            $supplierName = $supplier->getCompanyName();
 
             $em->remove($supplier);
             $em->flush();
 
-            // Direct logging as backup
-            $this->logActivity('DELETE', null, $request, $em, true, $supplierData);
+            // Log activity for admin/staff
+            $currentUser = $this->getCurrentUser($request, $em);
+            if ($currentUser) {
+                $this->activityLogService->logDelete(
+                    $currentUser,
+                    'Supplier',
+                    $supplierId,
+                    $supplierName,
+                    $request
+                );
+            }
 
             return $this->json(['message' => 'Supplier deleted successfully']);
         } catch (\Exception $e) {
             return $this->json(['error' => 'Failed to delete supplier: ' . $e->getMessage()], 500);
-        }
-    }
-
-    private function logActivity(string $action, ?Supplier $supplier, Request $request, EntityManagerInterface $em, bool $useNewConnection = false, ?array $supplierData = null): void
-    {
-        try {
-            // Get user from JWT token directly instead of Security component
-            $user = $this->getUserFromToken($request, $em);
-            
-            $this->logger->info('SupplierController: Direct logging attempt', [
-                'action' => $action,
-                'has_user' => $user !== null,
-                'user_class' => $user ? get_class($user) : null,
-                'user_id' => $user ? $user->getId() : null,
-                'username' => $user ? $user->getUsername() : null
-            ]);
-
-            if (!$user || !$user instanceof User) {
-                $this->logger->warning('SupplierController: No valid user for logging');
-                return;
-            }
-
-            $roles = $user->getRoles();
-            if (!in_array('ROLE_ADMIN', $roles) && !in_array('ROLE_STAFF', $roles)) {
-                return;
-            }
-
-            $targetData = ['entity' => 'Supplier'];
-            
-            if ($supplier) {
-                $targetData['entity_id'] = $supplier->getId();
-                $targetData['entity_name'] = $supplier->getCompanyName();
-                $targetData['email'] = $supplier->getEmail();
-                $targetData['status'] = $supplier->getStatus();
-            } elseif ($supplierData) {
-                // For deleted suppliers
-                $targetData = array_merge($targetData, [
-                    'entity_id' => $supplierData['id'],
-                    'entity_name' => $supplierData['companyName'],
-                    'email' => $supplierData['email'],
-                    'status' => $supplierData['status']
-                ]);
-            }
-
-            $activityLog = new ActivityLog();
-            $activityLog->setUserId($user->getId());
-            $activityLog->setUsername($user->getUsername());
-            $activityLog->setRole(implode(',', $user->getRoles()));
-            $activityLog->setAction($action);
-            $activityLog->setTargetData(json_encode($targetData));
-
-            // Use a fresh entity manager if needed to avoid disconnection issues
-            if ($useNewConnection) {
-                // Get a fresh entity manager
-                $freshEm = $this->container->get('doctrine')->getManager();
-                $freshEm->persist($activityLog);
-                $freshEm->flush();
-                $this->logger->info('SupplierController: Activity logged with fresh EM', [
-                    'action' => $action,
-                    'username' => $user->getUsername()
-                ]);
-            } else {
-                $em->persist($activityLog);
-                $em->flush();
-                $this->logger->info('SupplierController: Activity logged successfully', [
-                    'action' => $action,
-                    'username' => $user->getUsername()
-                ]);
-            }
-
-        } catch (\Exception $e) {
-            $this->logger->error('SupplierController: Failed to log activity', [
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString()
-            ]);
         }
     }
 }
