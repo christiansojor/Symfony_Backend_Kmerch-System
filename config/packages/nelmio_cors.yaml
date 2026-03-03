@@ -1,14 +1,17 @@
 nelmio_cors:
     defaults:
         origin_regex: true
-        allow_origin: ['*']
+        allow_origin: 
+            - 'https://unconsigned-bursate-walker.ngrok-free.dev/login'
+            - 'http://localhost:3000'  # for local development
         allow_methods: ['GET', 'OPTIONS', 'POST', 'PUT', 'PATCH', 'DELETE']
-        allow_headers: ['Content-Type', 'Authorization']
+        allow_headers: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept']
         expose_headers: ['Link']
         max_age: 3600
+        allow_credentials: true
     paths:
-        '^/api/':
-            allow_origin: ['*']
+        '^/api': 
+            allow_origin: ['*']  # Allow all origins for API routes
             allow_headers: ['*']
-            allow_methods: ['POST', 'PUT', 'GET', 'DELETE', 'PATCH']
+            allow_methods: ['POST', 'PUT', 'GET', 'DELETE', 'OPTIONS']
             max_age: 3600
